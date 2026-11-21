@@ -12,6 +12,9 @@ ohne App-Store: Seite in Safari öffnen, dann „Teilen“ → „Zum Home-Bilds
 - **Zweck und Geschäftspartner** direkt nach der Fahrt oder später eintragen;
   **Vorlagen** füllen beides mit einem Tipp aus; Hinweis auf Fahrten ohne Zweck
 - **Fahrten nachtragen**, bearbeiten, löschen; Kilometerstand freiwillig
+- **Kunden** mit Adresse und km ab Zuhause: unter „Fahrt nachtragen“ Kunde
+  antippen → Hin- und Rückfahrt werden mit Datum und km (ohne Uhrzeit)
+  als zwei Fahrten eingetragen
 - **Monats- und Jahresübersicht** mit Kilometerpauschale (km × 0,30 €)
 - **Export** als PDF (zum Abheften/Ausdrucken) und CSV (Excel, Steuerberater)
 - **Änderungsverlauf**: jede Änderung und Löschung wird auf dem Server

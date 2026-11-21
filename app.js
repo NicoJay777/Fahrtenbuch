@@ -179,6 +179,20 @@ async function reverseGeocode(p) {
   return fmt([name, [a.road || a.pedestrian, a.house_number].filter(Boolean).join(" "), [a.postcode, a.city || a.town || a.village || a.municipality].filter(Boolean).join(" ")]) || d.display_name || null;
 }
 
+// Koordinaten aus einer eingetippten Adresse – ebenfalls direkt vom Gerät
+async function forwardGeocode(q) {
+  try {
+    const r = await fetch(`https://photon.komoot.io/api/?q=${encodeURIComponent(q)}&lang=de&limit=1`);
+    if (!r.ok) throw new Error("Photon " + r.status);
+    const c = (await r.json()).features?.[0]?.geometry?.coordinates;
+    if (c) return { lat: c[1], lng: c[0] };
+  } catch (_) { /* weiter mit Nominatim */ }
+  const r = await fetch(`https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&accept-language=de&q=${encodeURIComponent(q)}`);
+  if (!r.ok) throw new Error("Adressdienst antwortet mit " + r.status);
+  const d = (await r.json())[0];
+  return d ? { lat: Number(d.lat), lng: Number(d.lon) } : null;
+}
+
 // Adressen und Straßenkilometer nachtragen, sobald Internet da ist
 async function enrich() {
   S.sync.enrichError = null;
@@ -291,17 +305,21 @@ function readTripForm() {
 async function saveTrip() {
   const f = readTripForm();
   const err = (m) => { $("#f_err").textContent = m; $("#f_err").hidden = false; };
-  if (!f.date || !f.t1) return err("Bitte Datum und Startzeit angeben.");
+  const old = S.sheet.id ? S.trips.find((x) => x.id === S.sheet.id) : null;
+  // Fahrt ohne Uhrzeit (Hin-/Rückfahrt zum Kunden): bleibt ohne Uhrzeit, solange beide Zeitfelder leer sind
+  const noTime = !!old?.without_time && !f.t1 && !f.t2;
+  if (!f.date || (!f.t1 && !noTime)) return err("Bitte Datum und Startzeit angeben.");
+  if (old?.without_time && !noTime && (!f.t1 || !f.t2)) return err("Bitte Beginn und Ende angeben – oder beide Zeitfelder leer lassen.");
   for (const [v, n] of [[f.km, "Kilometer"], [f.o1, "Kilometerstand Beginn"], [f.o2, "Kilometerstand Ende"]])
     if (Number.isNaN(v) || (v != null && v < 0)) return err(`${n}: bitte eine gültige Zahl eingeben.`);
   if (f.o1 != null && f.o2 != null && f.o2 < f.o1) return err("Kilometerstand Ende ist kleiner als Beginn.");
-  const started = combine(f.date, f.t1);
-  let ended = f.t2 ? combine(f.date, f.t2) : null;
+  const started = combine(f.date, noTime ? localTime(old.started_at) : f.t1);
+  let ended = noTime ? started : f.t2 ? combine(f.date, f.t2) : null;
   if (ended && ended < started) ended = new Date(new Date(ended).getTime() + 86400000).toISOString(); // über Mitternacht
-  const old = S.sheet.id ? S.trips.find((x) => x.id === S.sheet.id) : null;
   const t = old ? { ...old } : { id: uuid(), distance_source: null };
   if (!old && !ended) return err("Bitte die Endzeit angeben.");
   t.started_at = started; t.ended_at = old && !old.ended_at && !f.t2 ? null : ended;
+  if (old?.without_time) t.without_time = noTime;
   // nur übernehmen, was im Formular tatsächlich geändert wurde (Hintergrund-Abgleich kann inzwischen Adressen/km ergänzt haben)
   const init = S.sheet.init || {};
   if (f.start !== init.start) t.start_address = f.start || null;
@@ -396,19 +414,100 @@ async function deletePlace(id) {
   const pl = S.places.find((x) => x.id === id); if (!confirm(`Ort „${pl.name}“ löschen?`)) return;
   pl.deleted_at = new Date().toISOString(); await save("places", pl); render();
 }
-async function addTemplate() {
-  const name = prompt("Name der Vorlage (z. B. „Kunde Müller“):"); if (!name) return;
-  const purpose = prompt("Zweck der Fahrt:", "Kundentermin") ?? "";
-  const partner = prompt("Geschäftspartner / Firma:", name) ?? "";
-  await save("templates", { id: uuid(), name: name.trim(), purpose: purpose.trim() || null, partner: partner.trim() || null });
-  render();
+/* ---------- Kunden (Vorlagen mit Adresse und km ab Zuhause) ---------- */
+const customers = () => alive(S.templates).filter((tp) => tp.address && tp.distance_km != null).sort((a, b) => a.name.localeCompare(b.name));
+function openTemplate(id = null) { S.sheet = { type: "tpl", id }; render(); }
+async function saveTemplate() {
+  const g = (id) => $("#" + id).value.trim();
+  const err = (m) => { $("#c_err").textContent = m; $("#c_err").hidden = false; };
+  const km = parseNum(g("c_km"));
+  if (!g("c_name")) return err("Bitte einen Namen angeben.");
+  if (Number.isNaN(km) || (km != null && km < 0)) return err("Kilometer: bitte eine gültige Zahl eingeben.");
+  const old = S.sheet.id ? S.templates.find((x) => x.id === S.sheet.id) : null;
+  const tp = old ? { ...old } : { id: uuid() };
+  Object.assign(tp, { name: g("c_name"), purpose: g("c_purpose") || null, partner: g("c_partner") || null, address: g("c_address") || null, distance_km: km });
+  await save("templates", tp);
+  S.sheet = null; toast("Gespeichert"); render();
+}
+async function calcTemplateKm() {
+  const home = S.profile.home, addr = $("#c_address").value.trim();
+  if (!home) return toast("Bitte zuerst unter „Angaben für den Ausdruck“ die Heimatadresse eintragen.", 5000);
+  if (!addr) return toast("Bitte zuerst die Adresse des Kunden eintragen.");
+  if (!navigator.onLine) return toast("Zum Berechnen wird Internet benötigt.");
+  const btn = $("#c_calc"); btn.disabled = true; btn.textContent = "Wird berechnet …";
+  try {
+    const [a, b] = [await forwardGeocode(home), await forwardGeocode(addr)];
+    if (!a) throw new Error("Heimatadresse nicht gefunden.");
+    if (!b) throw new Error("Adresse des Kunden nicht gefunden.");
+    const r = await callRoute({ action: "route", start: a, end: b });
+    if (!Number.isFinite(r.km)) throw new Error("Keine Route gefunden.");
+    const el = $("#c_km"); if (el) el.value = String(r.km).replace(".", ",");
+    toast(`${fmtKm(r.km)} km – bitte kurz prüfen`);
+  } catch (e) { toast("Berechnung fehlgeschlagen: " + e.message, 6000); }
+  if ($("#c_calc")) { $("#c_calc").disabled = false; $("#c_calc").textContent = "km berechnen (Route ab Zuhause)"; }
+}
+
+/* ---------- Hin- und Rückfahrt zu einem Kunden nachtragen (nur Datum und km) ---------- */
+function openRoundTrip(id) { S.sheet = { type: "rt", id }; render(); }
+async function saveRoundTrip() {
+  const g = (id) => $("#" + id).value.trim();
+  const err = (m) => { $("#r_err").textContent = m; $("#r_err").hidden = false; };
+  const date = g("r_date"), home = g("r_home"), cust = g("r_cust"), k1 = parseNum(g("r_km1")), k2 = parseNum(g("r_km2"));
+  if (!date) return err("Bitte das Datum angeben.");
+  if (!home || !cust) return err("Bitte Heimatadresse und Adresse des Kunden angeben.");
+  for (const [v, n] of [[k1, "Kilometer Hinfahrt"], [k2, "Kilometer Rückfahrt"]])
+    if (v == null || Number.isNaN(v) || v < 0) return err(`${n}: bitte eine gültige Zahl eingeben.`);
+  const base = { purpose: g("r_purpose") || null, partner: g("r_partner") || null, distance_source: "manuell", without_time: true };
+  // ohne Uhrzeit: Hinfahrt 0:00, Rückfahrt 0:01, damit die Reihenfolge erhalten bleibt
+  const t1 = combine(date, "00:00"), t2 = combine(date, "00:01");
+  await save("trips", { id: uuid(), ...base, started_at: t1, ended_at: t1, start_address: home, end_address: cust, distance_km: round1(k1) });
+  await save("trips", { id: uuid(), ...base, started_at: t2, ended_at: t2, start_address: cust, end_address: home, distance_km: round1(k2) });
+  if (!S.profile.home) { S.profile = { ...S.profile, home }; await metaSet("profile", S.profile); }
+  S.sheet = null; toast("Hin- und Rückfahrt gespeichert"); render();
+}
+
+function sheetTemplate() {
+  const tp = S.sheet.id ? S.templates.find((x) => x.id === S.sheet.id) : null;
+  return `<div class="sheet-bg" data-act="closeBg"><div class="sheet" role="dialog" aria-modal="true">
+    <div class="sh"><h2>${tp ? "Kunde / Vorlage bearbeiten" : "Kunde / Vorlage anlegen"}</h2><button class="x" data-act="close" aria-label="Schließen">×</button></div>
+    <div id="c_err" class="banner err small" hidden></div>
+    <label for="c_name">Name</label><input id="c_name" value="${esc(tp?.name || "")}" placeholder="z. B. Kunde Müller">
+    <label for="c_purpose">Zweck der Fahrt</label><input id="c_purpose" value="${esc(tp ? tp.purpose || "" : "Kundentermin")}">
+    <label for="c_partner">Geschäftspartner / Firma</label><input id="c_partner" value="${esc(tp?.partner || "")}">
+    <label for="c_address">Adresse des Kunden</label><input id="c_address" value="${esc(tp?.address || "")}" placeholder="Straße Nr., PLZ Ort">
+    <label for="c_km">Kilometer einfache Strecke ab Zuhause</label><input id="c_km" inputmode="decimal" value="${tp?.distance_km != null ? String(tp.distance_km).replace(".", ",") : ""}">
+    <button class="btn link" id="c_calc" data-act="calcTpl">km berechnen (Route ab Zuhause)</button>
+    <p class="muted small">Mit Adresse und Kilometern erscheint der Kunde unter „Fahrt nachtragen“ – ein Tipp trägt Hin- und Rückfahrt ein. Ohne Adresse füllt die Vorlage nur Zweck und Geschäftspartner aus.</p>
+    <div class="spacer"></div>
+    <button class="btn" data-act="saveTpl">Speichern</button>
+  </div></div>`;
+}
+
+function sheetRoundTrip() {
+  const tp = S.templates.find((x) => x.id === S.sheet.id);
+  const km = tp?.distance_km != null ? String(tp.distance_km).replace(".", ",") : "";
+  return `<div class="sheet-bg" data-act="closeBg"><div class="sheet" role="dialog" aria-modal="true">
+    <div class="sh"><h2>Hin- und Rückfahrt</h2><button class="x" data-act="close" aria-label="Schließen">×</button></div>
+    <p class="muted small" style="margin:0">Legt zwei Fahrten an: Zuhause → ${esc(tp?.name || "Kunde")} und zurück. Nur für Termine, die direkt von zu Hause und zurück gefahren wurden.</p>
+    <div id="r_err" class="banner err small" hidden></div>
+    <label for="r_date">Datum</label><input id="r_date" type="date" value="${localDate(new Date().toISOString())}">
+    <label for="r_purpose">Zweck der Fahrt</label><input id="r_purpose" value="${esc(tp?.purpose || "")}">
+    <label for="r_partner">Geschäftspartner / Firma</label><input id="r_partner" value="${esc(tp?.partner || "")}">
+    <label for="r_home">Zuhause</label><input id="r_home" value="${esc(S.profile.home || "")}" placeholder="Heimatadresse">
+    <label for="r_cust">Kunde</label><input id="r_cust" value="${esc(tp?.address || "")}">
+    <div class="row"><div><label for="r_km1">km Hinfahrt</label><input id="r_km1" inputmode="decimal" value="${km}"></div>
+      <div><label for="r_km2">km Rückfahrt</label><input id="r_km2" inputmode="decimal" value="${km}"></div></div>
+    <p class="muted small">Umweg gefahren? Dann die km hier anpassen.</p>
+    <div class="spacer"></div>
+    <button class="btn" data-act="saveRt">Beide Fahrten speichern</button>
+  </div></div>`;
 }
 async function deleteTemplate(id) {
   const tp = S.templates.find((x) => x.id === id); if (!confirm(`Vorlage „${tp.name}“ löschen?`)) return;
   tp.deleted_at = new Date().toISOString(); await save("templates", tp); render();
 }
 async function saveProfile() {
-  S.profile = { name: $("#p_name").value.trim(), plate: $("#p_plate").value.trim() };
+  S.profile = { name: $("#p_name").value.trim(), plate: $("#p_plate").value.trim(), home: $("#p_home").value.trim() };
   await metaSet("profile", S.profile);
   if (navigator.onLine) sb.auth.updateUser({ data: { fb_profile: S.profile } }).catch(() => {});
   toast("Gespeichert");
@@ -449,7 +548,7 @@ function exportCsv() {
   if (!trips.length) return toast("Keine Fahrten im gewählten Zeitraum.");
   const q = (v) => `"${String(v ?? "").replace(/"/g, '""')}"`;
   const head = ["Datum", "Beginn", "Ende", "Start", "Ziel", "Zweck", "Geschäftspartner", "km-Stand Beginn", "km-Stand Ende", "Kilometer", "Betrag (€)", "Notiz"];
-  const rows = trips.map((t) => [fmtDateShort(t.started_at), fmtTime(t.started_at), fmtTime(t.ended_at), t.start_address, t.end_address, t.purpose, t.partner,
+  const rows = trips.map((t) => [fmtDateShort(t.started_at), t.without_time ? "" : fmtTime(t.started_at), t.without_time ? "" : fmtTime(t.ended_at), t.start_address, t.end_address, t.purpose, t.partner,
     t.odometer_start ?? "", t.odometer_end ?? "", fmtKm(t.distance_km), (Number(t.distance_km || 0) * CFG.kmRate).toFixed(2).replace(".", ","), t.notes]);
   rows.push(["Summe", "", "", "", "", "", "", "", "", fmtKm(sumKm(trips)), (sumKm(trips) * CFG.kmRate).toFixed(2).replace(".", ","), ""]);
   const csv = "﻿" + [head, ...rows].map((r) => r.map(q).join(";")).join("\r\n");
@@ -473,7 +572,7 @@ async function exportPdf() {
     doc.autoTable({
       startY: 27, styles: { fontSize: 8, cellPadding: 1.6, overflow: "linebreak" }, headStyles: { fillColor: [23, 92, 211] },
       head: [["Datum", "Zeit", "Start", "Ziel", "Zweck", "Geschäftspartner", "km-Stand", "km"]],
-      body: trips.map((t) => [fmtDateShort(t.started_at), `${fmtTime(t.started_at)}–${fmtTime(t.ended_at)}`, t.start_address || "", t.end_address || "",
+      body: trips.map((t) => [fmtDateShort(t.started_at), t.without_time ? "–" : `${fmtTime(t.started_at)}–${fmtTime(t.ended_at)}`, t.start_address || "", t.end_address || "",
         t.purpose || "", t.partner || "", t.odometer_start != null || t.odometer_end != null ? `${t.odometer_start ?? "?"} – ${t.odometer_end ?? "?"}` : "", fmtKm(t.distance_km)]),
       columnStyles: { 0: { cellWidth: 20 }, 1: { cellWidth: 20 }, 2: { cellWidth: 52 }, 3: { cellWidth: 52 }, 4: { cellWidth: 42 }, 5: { cellWidth: 36 }, 6: { cellWidth: 26 }, 7: { cellWidth: 16, halign: "right" } },
       foot: [["", "", "", "", "", "", "Summe", fmtKm(sumKm(trips))]], footStyles: { fillColor: [244, 246, 250], textColor: 20, fontStyle: "bold" },
@@ -517,7 +616,7 @@ function tripCard(t) {
   const to = t.end_address || (t.end_lat != null ? "Adresse wird ermittelt …" : "Ziel fehlt");
   return `<button class="trip" data-act="open" data-id="${t.id}">
     <div class="t1"><span>${fmtDate(t.started_at)}</span><span>${fmtKm(t.distance_km)} km</span></div>
-    <div class="t2">${fmtTime(t.started_at)}–${fmtTime(t.ended_at)} · ${esc(from)} → ${esc(to)}</div>
+    <div class="t2">${t.without_time ? "ohne Uhrzeit" : `${fmtTime(t.started_at)}–${fmtTime(t.ended_at)}`} · ${esc(from)} → ${esc(to)}</div>
     <div class="t2">${t.purpose ? esc(t.purpose) : ""}${t.partner ? " · " + esc(t.partner) : ""}${tags.join("")}</div>
   </button>`;
 }
@@ -608,15 +707,16 @@ function viewMehr() {
         <div style="flex:0 0 auto"><button class="chip" data-act="renamePlace" data-id="${p.id}">Umbenennen</button> <button class="chip" data-act="delPlace" data-id="${p.id}">Löschen</button></div></div>`).join("") || '<p class="muted small">Noch keine Orte.</p>'}
       <button class="btn ghost" data-act="addPlace" ${S.busy ? "disabled" : ""}>Aktuellen Standort als Ort speichern</button>
     </div>
-    <div class="card"><h2>Vorlagen</h2>
-      <p class="muted small">Füllen Zweck und Geschäftspartner mit einem Tipp aus.</p>
-      ${tpls.map((t) => `<div class="row" style="margin:8px 0"><div><b>${esc(t.name)}</b><div class="muted small">${esc([t.purpose, t.partner].filter(Boolean).join(" · "))}</div></div>
-        <div style="flex:0 0 auto"><button class="chip" data-act="delTpl" data-id="${t.id}">Löschen</button></div></div>`).join("") || '<p class="muted small">Noch keine Vorlagen.</p>'}
-      <button class="btn ghost" data-act="addTpl">Vorlage anlegen</button>
+    <div class="card"><h2>Kunden &amp; Vorlagen</h2>
+      <p class="muted small">Füllen Zweck und Geschäftspartner mit einem Tipp aus. Kunden mit Adresse und km tragen unter „Fahrt nachtragen“ Hin- und Rückfahrt ein.</p>
+      ${tpls.map((t) => `<div class="row" style="margin:8px 0"><div><b>${esc(t.name)}</b><div class="muted small">${esc([t.purpose, t.partner, t.address, t.distance_km != null ? fmtKm(t.distance_km) + " km einfach" : ""].filter(Boolean).join(" · "))}</div></div>
+        <div style="flex:0 0 auto"><button class="chip" data-act="editTpl" data-id="${t.id}">Bearbeiten</button> <button class="chip" data-act="delTpl" data-id="${t.id}">Löschen</button></div></div>`).join("") || '<p class="muted small">Noch keine Kunden oder Vorlagen.</p>'}
+      <button class="btn ghost" data-act="addTpl">Kunde / Vorlage anlegen</button>
     </div>
     <div class="card"><h2>Angaben für den Ausdruck</h2>
       <label for="p_name">Name / Firma</label><input id="p_name" value="${esc(S.profile.name || "")}" autocomplete="name">
       <label for="p_plate">Kennzeichen</label><input id="p_plate" value="${esc(S.profile.plate || "")}" placeholder="z. B. NU-AB 123">
+      <label for="p_home">Heimatadresse (Start für Hin- und Rückfahrt zu Kunden)</label><input id="p_home" value="${esc(S.profile.home || "")}" placeholder="Straße Nr., PLZ Ort" autocomplete="street-address">
       <div class="spacer"></div><button class="btn ghost" data-act="saveProfile">Speichern</button>
     </div>
     <div class="card"><h2>Abgleich</h2>
@@ -634,6 +734,7 @@ function sheetTrip() {
   const isNew = !t;
   const st = t?.started_at || new Date().toISOString();
   const placeOpts = alive(S.places).map((p) => `<option value="${p.id}">${esc(p.name)}</option>`).join("");
+  const custChips = customers().map((tp) => `<button class="chip" data-act="rt" data-id="${tp.id}">${esc(tp.name)}</button>`).join("");
   const tplChips = alive(S.templates).map((tp) => `<button class="chip" data-act="tpl" data-id="${tp.id}">${esc(tp.name)}</button>`).join("");
   const src = { route: "berechnet (Route)", luftlinie: "geschätzt – wird mit Internet genau berechnet", manuell: "von Hand eingetragen" }[t?.distance_source] || "";
   const odoStart = t ? t.odometer_start : lastOdometer();
@@ -642,12 +743,14 @@ function sheetTrip() {
     <div class="sh"><h2>${isNew ? "Fahrt nachtragen" : S.sheet.afterEnd ? "Fahrt beendet" : "Fahrt bearbeiten"}</h2><button class="x" data-act="close" aria-label="Schließen">×</button></div>
     ${S.sheet.afterEnd ? `<p class="muted small" style="margin:0">${fmtKm(t.distance_km)} km${t.distance_source === "luftlinie" ? " (vorläufig)" : ""} – jetzt Zweck und Geschäftspartner eintragen.</p>` : ""}
     <div id="f_err" class="banner err small" hidden></div>
+    ${isNew && custChips ? `<label>Hin- und Rückfahrt zu Kunde</label><div class="chips">${custChips}</div>` : ""}
     <label for="f_purpose">Zweck der Fahrt</label><input id="f_purpose" value="${esc(t?.purpose || "")}" placeholder="z. B. Kundentermin, Lieferung, Einkauf Material">
     ${tplChips ? `<div class="chips">${tplChips}</div>` : ""}
     <label for="f_partner">Geschäftspartner / Firma</label><input id="f_partner" value="${esc(t?.partner || "")}">
     <div class="row"><div><label for="f_date">Datum</label><input id="f_date" type="date" value="${localDate(st)}"></div></div>
-    <div class="row"><div><label for="f_t1">Beginn</label><input id="f_t1" type="time" value="${t ? localTime(t.started_at) : ""}"></div>
-      <div><label for="f_t2">Ende</label><input id="f_t2" type="time" value="${t?.ended_at ? localTime(t.ended_at) : ""}"></div></div>
+    <div class="row"><div><label for="f_t1">Beginn</label><input id="f_t1" type="time" value="${t && !t.without_time ? localTime(t.started_at) : ""}"></div>
+      <div><label for="f_t2">Ende</label><input id="f_t2" type="time" value="${t?.ended_at && !t.without_time ? localTime(t.ended_at) : ""}"></div></div>
+    ${t?.without_time ? '<p class="muted small" style="margin:4px 0 0">Ohne Uhrzeit nachgetragen – Zeitfelder dürfen leer bleiben.</p>' : ""}
     <label for="f_start">Start</label><input id="f_start" value="${esc(t?.start_address || "")}" placeholder="${t?.start_lat != null ? "Adresse wird ermittelt …" : "Adresse"}">
     ${placeOpts ? `<select data-place="start"><option value="">Gespeicherten Ort wählen …</option>${placeOpts}</select>` : ""}
     <label for="f_end">Ziel</label><input id="f_end" value="${esc(t?.end_address || "")}" placeholder="${t?.end_lat != null ? "Adresse wird ermittelt …" : "Adresse"}">
@@ -701,7 +804,7 @@ function render() {
     <main>${views[S.tab]()}</main>
     <nav class="tabs">${[["fahrt", "🚗", "Fahrt"], ["fahrten", "📋", "Fahrten"], ["auswertung", "📊", "Auswertung"], ["mehr", "⚙️", "Mehr"]]
       .map(([k, ic, l]) => `<button class="${S.tab === k ? "on" : ""}" data-act="tab" data-tab="${k}"><span class="ic">${ic}</span>${l}</button>`).join("")}</nav>
-    ${S.sheet?.type === "trip" ? sheetTrip() : ""}`;
+    ${S.sheet?.type === "trip" ? sheetTrip() : S.sheet?.type === "tpl" ? sheetTemplate() : S.sheet?.type === "rt" ? sheetRoundTrip() : ""}`;
   if (!S.sheet) window.scrollTo(0, scroll);
   const a = activeTrip();
   if (a && S.tab === "fahrt") {
@@ -752,7 +855,8 @@ const ACT = {
   toggleMissing: () => { S.onlyMissing = !S.onlyMissing; render(); },
   pdf: exportPdf, csv: exportCsv,
   addPlace: addPlaceHere, renamePlace: (el) => renamePlace(el.dataset.id), delPlace: (el) => deletePlace(el.dataset.id),
-  addTpl: addTemplate, delTpl: (el) => deleteTemplate(el.dataset.id), saveProfile,
+  addTpl: () => openTemplate(), editTpl: (el) => openTemplate(el.dataset.id), saveTpl: saveTemplate, calcTpl: calcTemplateKm,
+  rt: (el) => openRoundTrip(el.dataset.id), saveRt: saveRoundTrip, delTpl: (el) => deleteTemplate(el.dataset.id), saveProfile,
   sync: () => { if (!navigator.onLine) return toast("Gerade kein Internet – wird automatisch nachgeholt."); sync(); },
   signout: signOut,
   loginMode: () => { S.loginMode = S.loginMode === "register" ? "login" : "register"; render(); },
