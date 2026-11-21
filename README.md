@@ -25,7 +25,8 @@ ohne App-Store: Seite in Safari öffnen, dann „Teilen“ → „Zum Home-Bilds
 |---|---|
 | Web-App (HTML/CSS/JS, ohne Build-Schritt) | Repo-Wurzel, ausgeliefert über GitHub Pages |
 | Datenbank + Anmeldung | Supabase-Projekt „Fahrtenbuch“ (`mvzvzqejytwabvcmibgf`, Frankfurt) |
-| Adressen und Kilometer | Supabase Edge Function `route` → OpenStreetMap (Nominatim) und OSRM |
+| Straßenkilometer | Supabase Edge Function `route` → OSRM (OpenStreetMap) |
+| Adressen | direkt vom iPhone → Photon, ersatzweise Nominatim (OpenStreetMap); die Dienste sperren Anfragen von Supabase-Servern |
 | Datenbank-Schema | `supabase/migrations/` |
 
 Bibliotheken liegen in `vendor/` (supabase-js, jsPDF, jsPDF-AutoTable; alle MIT).
@@ -37,15 +38,16 @@ Bibliotheken liegen in `vendor/` (supabase-js, jsPDF, jsPDF-AutoTable; alle MIT)
   Supabase – er ist absichtlich im Code und gibt ohne Anmeldung keinen
   Zugriff auf Daten.
 - Standorte werden nur beim Tippen auf Start/Ende abgefragt, nicht dauerhaft.
-- Für Adresse und Route werden die Koordinaten an OpenStreetMap-Dienste
-  übermittelt (über die Supabase-Funktion, nicht direkt vom iPhone).
+- Für die Adresse schickt das iPhone die Koordinaten direkt an Photon
+  (komoot) bzw. Nominatim; für die Kilometer gehen Start und Ziel über die
+  Supabase-Funktion an OSRM. Alles OpenStreetMap-Dienste, ohne Konto.
 
 ## Einrichtung (einmalig)
 
 1. **GitHub Pages:** Repo → Settings → Pages → „Deploy from a branch“ →
    `main` / `(root)`.
 2. **Supabase → Authentication → URL Configuration:** „Site URL“ auf die
-   Pages-Adresse setzen (z. B. `https://nicojay777.github.io/fahrtenbuch/`),
+   Pages-Adresse setzen (z. B. `https://nicojay777.github.io/Fahrtenbuch/` (großes F!)),
    damit der Link in der Bestätigungs-Mail zur App führt.
 3. Konto in der App anlegen und E-Mail bestätigen.
 4. Danach **Supabase → Authentication → Sign In / Providers →

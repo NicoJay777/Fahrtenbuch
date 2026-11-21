@@ -1,5 +1,5 @@
 // Offline-Speicher für die App-Dateien. Bei jeder Auslieferung VERSION erhöhen.
-const VERSION = "fb-v1";
+const VERSION = "fb-v2";
 const FILES = [
   "./", "index.html", "style.css", "app.js", "config.js", "manifest.webmanifest",
   "icon-180.png", "icon-192.png", "icon-512.png",

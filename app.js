@@ -158,6 +158,27 @@ async function callRoute(body) {
   return data;
 }
 
+// Adresse aus Koordinaten – direkt vom Gerät (die Dienste sperren Server-Anfragen).
+// Photon zuerst, Nominatim als Ausweich; beides OpenStreetMap-Daten.
+async function reverseGeocode(p) {
+  const fmt = (parts) => parts.filter(Boolean).join(", ");
+  try {
+    const r = await fetch(`https://photon.komoot.io/reverse?lat=${p.lat}&lon=${p.lng}&lang=de&limit=1`);
+    if (!r.ok) throw new Error("Photon " + r.status);
+    const f = (await r.json()).features?.[0]?.properties;
+    if (f) {
+      const name = f.name && f.name !== f.street ? f.name : null;
+      const s = fmt([name, [f.street, f.housenumber].filter(Boolean).join(" "), [f.postcode, f.city || f.town || f.village || f.district].filter(Boolean).join(" ")]);
+      if (s) return s;
+    }
+  } catch (_) { /* weiter mit Nominatim */ }
+  const r = await fetch(`https://nominatim.openstreetmap.org/reverse?format=jsonv2&zoom=18&addressdetails=1&accept-language=de&lat=${p.lat}&lon=${p.lng}`);
+  if (!r.ok) throw new Error("Adressdienst antwortet mit " + r.status);
+  const d = await r.json(); const a = d.address || {};
+  const name = d.name && d.name !== a.road ? d.name : null;
+  return fmt([name, [a.road || a.pedestrian, a.house_number].filter(Boolean).join(" "), [a.postcode, a.city || a.town || a.village || a.municipality].filter(Boolean).join(" ")]) || d.display_name || null;
+}
+
 // Adressen und Straßenkilometer nachtragen, sobald Internet da ist
 async function enrich() {
   S.sync.enrichError = null;
@@ -168,14 +189,14 @@ async function enrich() {
     try {
       let t = cur(id);
       if (t.start_lat != null && !t.start_address) {
-        const r = await callRoute({ action: "reverse", point: { lat: t.start_lat, lng: t.start_lng } });
-        await apply(id, (x) => (r.address && !x.start_address ? ((x.start_address = r.address), true) : false));
+        const address = await reverseGeocode({ lat: t.start_lat, lng: t.start_lng });
+        await apply(id, (x) => (address && !x.start_address ? ((x.start_address = address), true) : false));
         await sleep(1100);
       }
       t = cur(id);
       if (t.end_lat != null && !t.end_address) {
-        const r = await callRoute({ action: "reverse", point: { lat: t.end_lat, lng: t.end_lng } });
-        await apply(id, (x) => (r.address && !x.end_address ? ((x.end_address = r.address), true) : false));
+        const address = await reverseGeocode({ lat: t.end_lat, lng: t.end_lng });
+        await apply(id, (x) => (address && !x.end_address ? ((x.end_address = address), true) : false));
         await sleep(1100);
       }
       t = cur(id);

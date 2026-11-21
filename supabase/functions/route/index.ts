@@ -2,7 +2,8 @@
 // Aufruf nur mit gültiger Anmeldung (verify_jwt).
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 
-const UA = "Fahrtenbuch-privat/1.0 (Supabase Edge Function)";
+const SITE = "https://nicojay777.github.io/Fahrtenbuch/";
+const UA = `Fahrtenbuch/1.0 (+${SITE})`;
 const cors = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
@@ -17,10 +18,11 @@ function validPoint(p: any) {
   return p && Number.isFinite(p.lat) && Number.isFinite(p.lng) && Math.abs(p.lat) <= 90 && Math.abs(p.lng) <= 180;
 }
 
-async function reverse(p: { lat: number; lng: number }): Promise<string | null> {
+// Adresse aus Koordinaten: erst Nominatim, bei Ablehnung Photon (beides OpenStreetMap-Daten)
+async function reverseNominatim(p: { lat: number; lng: number }): Promise<string | null> {
   const url = `https://nominatim.openstreetmap.org/reverse?format=jsonv2&zoom=18&addressdetails=1&accept-language=de&lat=${p.lat}&lon=${p.lng}`;
-  const r = await fetch(url, { headers: { "User-Agent": UA } });
-  if (!r.ok) throw new Error(`Adressdienst antwortet mit ${r.status}`);
+  const r = await fetch(url, { headers: { "User-Agent": UA, "Referer": SITE } });
+  if (!r.ok) throw new Error(`Nominatim antwortet mit ${r.status}`);
   const d = await r.json();
   const a = d.address ?? {};
   const street = [a.road ?? a.pedestrian ?? a.footway, a.house_number].filter(Boolean).join(" ");
@@ -29,6 +31,25 @@ async function reverse(p: { lat: number; lng: number }): Promise<string | null> 
   const name = d.name && d.name !== a.road ? d.name : null;
   const s = [name, street, plzOrt].filter(Boolean).join(", ");
   return s || d.display_name || null;
+}
+
+async function reversePhoton(p: { lat: number; lng: number }): Promise<string | null> {
+  const r = await fetch(`https://photon.komoot.io/reverse?lat=${p.lat}&lon=${p.lng}&lang=de&limit=1`, { headers: { "User-Agent": UA } });
+  if (!r.ok) throw new Error(`Photon antwortet mit ${r.status}`);
+  const f = (await r.json()).features?.[0]?.properties;
+  if (!f) return null;
+  const street = [f.street, f.housenumber].filter(Boolean).join(" ");
+  const plzOrt = [f.postcode, f.city ?? f.town ?? f.village ?? f.district].filter(Boolean).join(" ");
+  const name = f.name && f.name !== f.street ? f.name : null;
+  return [name, street, plzOrt].filter(Boolean).join(", ") || null;
+}
+
+async function reverse(p: { lat: number; lng: number }): Promise<string | null> {
+  try { return await reverseNominatim(p); }
+  catch (e1) {
+    try { return await reversePhoton(p); }
+    catch (e2) { throw new Error(`${(e1 as Error).message}; ${(e2 as Error).message}`); }
+  }
 }
 
 async function route(a: { lat: number; lng: number }, b: { lat: number; lng: number }) {
