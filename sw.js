@@ -1,5 +1,5 @@
 // Offline-Speicher für die App-Dateien. Bei jeder Auslieferung VERSION erhöhen.
-const VERSION = "fb-v2";
+const VERSION = "fb-v3";
 const FILES = [
   "./", "index.html", "style.css", "app.js", "config.js", "manifest.webmanifest",
   "icon-180.png", "icon-192.png", "icon-512.png",
@@ -7,7 +7,7 @@ const FILES = [
 ];
 
 self.addEventListener("install", (e) => {
-  e.waitUntil(caches.open(VERSION).then((c) => c.addAll(FILES)).then(() => self.skipWaiting()));
+  e.waitUntil(caches.open(VERSION).then((c) => c.addAll(FILES.map((f) => new Request(f, { cache: "reload" })))).then(() => self.skipWaiting())); // am Browser-Cache vorbei
 });
 
 self.addEventListener("activate", (e) => {
